@@ -53,19 +53,51 @@ def load_data() -> pd.DataFrame:
 
     # 2. Intentar descarga directa del ALDN
     try:
-        url = (f"https://fire.ak.blm.gov/content/maps/aicc/Data/"
-               f"Data%20(zipped%20shapefiles)/Lightning{CURRENT_YEAR}.zip")
+        url = "https://fire.ak.blm.gov/content/maps/aicc/Data/Data%20(zipped%20Shapefiles)/CurrentYearLightning_SHP.zip"
         import urllib.request
         urllib.request.urlretrieve(url, "lightning.zip")
         with zipfile.ZipFile("lightning.zip") as z:
             z.extractall("lightning_data")
         import geopandas as gpd
-        shp = next(f for root, _, files in os.walk("lightning_data")
-                   for f in files if f.endswith(".shp"))
-        gdf = gpd.read_file(os.path.join("lightning_data", shp))
-        # ... procesamiento (igual que en el notebook)
-        df = pd.DataFrame(gdf.drop(columns='geometry'))
-        return df
+        shp_path = None
+        for root, _, files in os.walk("lightning_data"):
+            for f in files:
+                if f.endswith(".shp"):
+                    shp_path = os.path.join(root, f)
+        if shp_path:
+            gdf = gpd.read_file(shp_path)
+            gdf = gdf.to_crs('EPSG:4326')
+            # Manejar columnas duplicadas DATETIME
+            cols = list(gdf.columns)
+            new_cols = []
+            seen = {}
+            for c in cols:
+                if c in seen:
+                    seen[c] += 1
+                    new_cols.append(f"{c}_{seen[c]}")
+                else:
+                    seen[c] = 0
+                    new_cols.append(c)
+            gdf.columns = new_cols
+            # Buscar columna de datetime string legible
+            dt_col = next((c for c in gdf.columns if 'DATETIME' in c and gdf[c].dtype == object), None)
+            if dt_col:
+                gdf['DATETIME_FULL'] = pd.to_datetime(gdf[dt_col], format='%Y/%m/%d %H:%M', errors='coerce')
+            else:
+                dt_col2 = next((c for c in gdf.columns if 'DATETIME' in c), None)
+                gdf['DATETIME_FULL'] = pd.to_datetime(gdf[dt_col2], errors='coerce') if dt_col2 else pd.NaT
+            df = pd.DataFrame({
+                'DATETIME': gdf['DATETIME_FULL'],
+                'DATE':     gdf['DATETIME_FULL'].dt.strftime('%Y-%m-%d'),
+                'MONTH':    gdf['DATETIME_FULL'].dt.month,
+                'HOUR':     gdf['DATETIME_FULL'].dt.hour,
+                'LAT':      gdf.geometry.y,
+                'LON':      gdf.geometry.x,
+                'AMPLITUDE': gdf['AMPLITUDE'] / 1000 if 'AMPLITUDE' in gdf.columns else 0,
+                'TYPE':     gdf['TYPE'] if 'TYPE' in gdf.columns else 'UNKNOWN',
+                'POLARITY': gdf['POLARITY'] if 'POLARITY' in gdf.columns else 'UNKNOWN',
+            })
+            return df.dropna(subset=['LAT', 'LON'])
     except Exception:
         pass
 
@@ -74,23 +106,21 @@ def load_data() -> pd.DataFrame:
     n = 18000
     months = np.random.choice([5,6,7,8,9], n, p=[0.04, 0.22, 0.42, 0.25, 0.07])
     days = np.random.randint(1, 29, n)
-    hours = np.random.choice(range(24), n,
-        p=[0.01,0.01,0.01,0.01,0.01,0.02,0.02,0.02,0.03,0.04,
-   0.05,0.06,0.08,0.09,0.10,0.10,0.09,0.08,0.07,0.06,0.05,0.04,0.03,0.02]
-           
+    hours = np.random.choice(range(24), n)
     datetimes = pd.to_datetime(
         {'year': CURRENT_YEAR, 'month': months, 'day': days, 'hour': hours}
     )
     return pd.DataFrame({
-        'DATETIME': datetimes,
-        'LAT': np.random.normal(64.5, 4.2, n).clip(55, 71),
-        'LON': np.random.normal(-153, 8, n).clip(-170, -132),
-        'AMPLITUDE': np.random.normal(-30, 14, n),
+        'DATETIME':     datetimes,
+        'LAT':          np.random.normal(64.5, 4.2, n).clip(55, 71),
+        'LON':          np.random.normal(-153, 8, n).clip(-170, -132),
+        'AMPLITUDE':    np.random.normal(-30, 14, n),
         'MULTIPLICITY': np.random.choice([1,2,3,4,5], n, p=[0.5,0.25,0.12,0.08,0.05]),
-        'TYPE': np.random.choice(['CG', 'IC'], n, p=[0.70, 0.30]),
-        'MONTH': months,
-        'HOUR': hours,
-        'DATE': datetimes.dt.date,
+        'TYPE':         np.random.choice(['GROUND_STROKE', 'CLOUD_STROKE'], n, p=[0.70, 0.30]),
+        'POLARITY':     np.random.choice(['Negative', 'Positive', 'Cloud To Cloud'], n, p=[0.60, 0.10, 0.30]),
+        'MONTH':        months,
+        'HOUR':         hours,
+        'DATE':         datetimes.dt.strftime('%Y-%m-%d'),
     })
 
 
@@ -101,12 +131,9 @@ df_full['DATE'] = pd.to_datetime(df_full['DATETIME']).dt.date
 
 # ── Sidebar: Controles ────────────────────────────────────────────────────
 with st.sidebar:
-    st.image("https://fire.ak.blm.gov/images/aicc-logo.png",
-             use_container_width=True, caption="BLM Alaska Fire Service")
     st.markdown(f"## ⚡ Alaska Lightning {CURRENT_YEAR}")
     st.markdown("---")
 
-    # Filtro de rango de fechas
     st.subheader("📅 Rango de Fechas")
     min_date = df_full['DATE'].min()
     max_date = df_full['DATE'].max()
@@ -121,7 +148,6 @@ with st.sidebar:
     else:
         start_d, end_d = min_date, max_date
 
-    # Filtros adicionales
     st.subheader("🔧 Filtros")
     if 'TYPE' in df_full.columns:
         stroke_types = st.multiselect(
@@ -167,10 +193,11 @@ st.markdown("---")
 # ── KPIs ──────────────────────────────────────────────────────────────────
 col1, col2, col3, col4, col5 = st.columns(5)
 col1.metric("⚡ Total Rayos", f"{len(df):,}")
-if 'TYPE' in df.columns:
-    cg = len(df[df['TYPE']=='CG'])
-    col2.metric("↓ Nube-Tierra (CG)", f"{cg:,}", f"{cg/len(df)*100:.0f}%" if len(df) > 0 else "")
-    col3.metric("↕ Intra-nube (IC)", f"{len(df[df['TYPE']=='IC']):,}")
+if 'TYPE' in df.columns and len(df) > 0:
+    cg = len(df[df['TYPE']=='GROUND_STROKE'])
+    ic = len(df[df['TYPE']=='CLOUD_STROKE'])
+    col2.metric("↓ GROUND_STROKE", f"{cg:,}", f"{cg/len(df)*100:.0f}%")
+    col3.metric("↕ CLOUD_STROKE",  f"{ic:,}", f"{ic/len(df)*100:.0f}%")
 if 'AMPLITUDE' in df.columns and len(df) > 0:
     col4.metric("⚡ kA Promedio", f"{df['AMPLITUDE'].abs().mean():.1f}")
 if len(df) > 0:
@@ -185,10 +212,8 @@ tab1, tab2, tab3, tab4 = st.tabs(["🗺️ Mapa Espacial", "📊 Dinámicas", "�
 # ─── Tab 1: Mapa ──────────────────────────────────────────────────────────
 with tab1:
     st.subheader("Distribución Espacial de Rayos")
-
     map_type = st.radio("Tipo de visualización:",
-                        ["Mapa de Calor", "Puntos (scatter)"],
-                        horizontal=True)
+                        ["Mapa de Calor", "Puntos (scatter)"], horizontal=True)
 
     sample = df.sample(min(max_points, len(df)), random_state=42) if len(df) > max_points else df
 
@@ -209,7 +234,6 @@ with tab1:
 
     st_folium(m, width=None, height=550, returned_objects=[])
 
-    # Stats por zona
     st.subheader("Distribución por Zona Geográfica")
     df['ZONE'] = pd.cut(df['LON'], bins=[-172, -160, -150, -140, -130],
                         labels=['Oeste Extremo', 'Alaska Oeste', 'Alaska Centro', 'Alaska Este'])
@@ -225,10 +249,8 @@ with tab1:
 # ─── Tab 2: Dinámicas ─────────────────────────────────────────────────────
 with tab2:
     st.subheader("Dinámicas de Rayos")
-
     c1, c2 = st.columns(2)
 
-    # Ciclo diurno
     with c1:
         if 'HOUR' in df.columns and len(df) > 0:
             hourly = df.groupby('HOUR').size().reset_index(name='count')
@@ -240,7 +262,6 @@ with tab2:
                                ticktext=[f'{h:02d}h' for h in range(0,24,3)])
             st.plotly_chart(fig_h, use_container_width=True)
 
-    # Distribución por tipo y mes
     with c2:
         if 'TYPE' in df.columns and 'MONTH' in df.columns and len(df) > 0:
             type_month = df.groupby(['MONTH', 'TYPE']).size().reset_index(name='count')
@@ -250,11 +271,9 @@ with tab2:
             fig_tm = px.bar(type_month, x='MES', y='count', color='TYPE',
                             template='plotly_dark', barmode='group',
                             title="Tipo de Rayo por Mes",
-                            color_discrete_map={'CG': '#ff7b72', 'IC': '#79c0ff'},
                             labels={'count': 'Rayos', 'MES': 'Mes'})
             st.plotly_chart(fig_tm, use_container_width=True)
 
-    # Heatmap hora × mes
     if 'HOUR' in df.columns and 'MONTH' in df.columns and len(df) > 0:
         pivot = df.pivot_table(index='HOUR', columns='MONTH', aggfunc='size', fill_value=0)
         pivot.columns = [calendar.month_abbr[c] for c in pivot.columns]
@@ -264,24 +283,21 @@ with tab2:
         fig_hm.update_layout(height=400)
         st.plotly_chart(fig_hm, use_container_width=True)
 
-    # Distribución de amplitud
     if 'AMPLITUDE' in df.columns and len(df) > 0:
         c3, c4 = st.columns(2)
         with c3:
             fig_amp = px.histogram(df, x='AMPLITUDE', nbins=60, template='plotly_dark',
                                    title="Distribución de Amplitud (kA)",
                                    color_discrete_sequence=['#3fb950'],
-                                   labels={'AMPLITUDE': 'Amplitud (kA)', 'count': 'Frecuencia'})
+                                   labels={'AMPLITUDE': 'Amplitud (kA)'})
             fig_amp.add_vline(x=df['AMPLITUDE'].mean(), line_dash='dash',
                               line_color='red', annotation_text="Media")
             st.plotly_chart(fig_amp, use_container_width=True)
-
         with c4:
             if 'TYPE' in df.columns:
                 fig_box = px.box(df, x='TYPE', y='AMPLITUDE', color='TYPE',
                                  template='plotly_dark',
                                  title="Amplitud por Tipo de Rayo",
-                                 color_discrete_map={'CG': '#ff7b72', 'IC': '#79c0ff'},
                                  labels={'TYPE': 'Tipo', 'AMPLITUDE': 'Amplitud (kA)'})
                 st.plotly_chart(fig_box, use_container_width=True)
 
@@ -293,7 +309,7 @@ with tab3:
     if len(df) > 0 and 'DATE' in df.columns:
         daily_counts = df.groupby('DATE').size().reset_index(name='count')
         daily_counts['DATE'] = pd.to_datetime(daily_counts['DATE'])
-        daily_counts['rolling7'] = daily_counts['count'].rolling(7, center=True).mean()
+        daily_counts['rolling7']  = daily_counts['count'].rolling(7,  center=True).mean()
         daily_counts['rolling30'] = daily_counts['count'].rolling(30, center=True).mean()
 
         fig_ts = go.Figure()
@@ -317,7 +333,6 @@ with tab3:
         )
         st.plotly_chart(fig_ts, use_container_width=True)
 
-        # Top 10 días
         st.subheader("🏆 Top 10 Días con Mayor Actividad")
         top10 = df.groupby('DATE').size().nlargest(10).reset_index(name='Rayos')
         top10['Fecha'] = top10['DATE'].astype(str)
@@ -327,7 +342,6 @@ with tab3:
         fig_top.update_layout(yaxis={'categoryorder': 'total ascending'}, height=400)
         st.plotly_chart(fig_top, use_container_width=True)
 
-        # Distribución por semana del año
         df['WEEK'] = pd.to_datetime(df['DATETIME']).dt.isocalendar().week
         weekly = df.groupby('WEEK').size().reset_index(name='count')
         fig_wk = px.bar(weekly, x='WEEK', y='count', template='plotly_dark',
@@ -340,13 +354,12 @@ with tab3:
 # ─── Tab 4: Datos ─────────────────────────────────────────────────────────
 with tab4:
     st.subheader("📋 Datos Filtrados")
+    display_cols = [c for c in df.columns if c != 'geometry']
     st.dataframe(
-        df.drop(columns=['geometry'] if 'geometry' in df.columns else [])
-          .sort_values('DATETIME', ascending=False)
-          .head(1000),
+        df[display_cols].sort_values('DATETIME', ascending=False).head(1000),
         use_container_width=True, height=400
     )
-    csv = df.to_csv(index=False).encode('utf-8')
+    csv = df[display_cols].to_csv(index=False).encode('utf-8')
     st.download_button(
         "⬇️ Descargar CSV filtrado",
         data=csv,
